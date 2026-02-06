@@ -1,45 +1,81 @@
 
 import React, { useState } from 'react';
-import { AppData, UserSession } from '../types';
+import { UserSession } from '../types';
 import { Video, Lock, User as UserIcon, AlertCircle, Loader2, Crown } from 'lucide-react';
+import { supabase } from '../services/supabaseClient';
 
 interface LoginProps {
   onLogin: (user: UserSession) => void;
-  data: AppData;
 }
 
-const Login: React.FC<LoginProps> = ({ onLogin, data }) => {
+const Login: React.FC<LoginProps> = ({ onLogin }) => {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [isAuthenticating, setIsAuthenticating] = useState(false);
 
-  const handleLogin = (e: React.FormEvent) => {
+  const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
     setIsAuthenticating(true);
 
-    const inputUser = username.trim().toLowerCase();
+    const inputUser = username.trim();
     const inputPass = password.trim();
+    const email = inputUser.includes('@') ? inputUser : `${inputUser.toLowerCase()}@colombia1.local`;
 
-    setTimeout(() => {
-      const user = data.rules.accounts.find(
-        u => u.username.toLowerCase() === inputUser && u.password === inputPass
-      );
+    try {
+      const { data: signInData, error: signInError } = await supabase.auth.signInWithPassword({
+        email,
+        password: inputPass
+      });
 
-      if (user) {
-        onLogin({
-          id: user.id,
-          name: user.name,
-          role: user.role,
-          username: user.username,
-          roomId: user.roomId
-        });
-      } else {
-        setError('Acceso denegado. Revisa tus credenciales.');
-        setIsAuthenticating(false);
+      if (signInError || !signInData.user) {
+        throw signInError || new Error('Auth failed');
       }
-    }, 600);
+
+      const { data: profile, error: profileError } = await supabase
+        .from('profiles')
+        .select('username, full_name, role, room_id')
+        .eq('id', signInData.user.id)
+        .maybeSingle();
+
+      if (profileError) {
+        throw profileError;
+      }
+
+      const finalProfile = profile || {
+        username: email.split('@')[0],
+        full_name: email.split('@')[0],
+        role: 'model',
+        room_id: null
+      };
+
+      if (!profile) {
+        await supabase.from('profiles').upsert({
+          id: signInData.user.id,
+          username: finalProfile.username,
+          full_name: finalProfile.full_name,
+          role: finalProfile.role,
+          room_id: finalProfile.room_id
+        });
+      }
+
+      const role = finalProfile.role === 'admin' || finalProfile.role === 'manager' || finalProfile.role === 'model'
+        ? finalProfile.role
+        : 'model';
+
+      onLogin({
+        id: signInData.user.id,
+        name: finalProfile.full_name || finalProfile.username,
+        role,
+        username: finalProfile.username,
+        roomId: finalProfile.room_id ?? undefined
+      });
+    } catch {
+      setError('Acceso denegado. Revisa tus credenciales.');
+    } finally {
+      setIsAuthenticating(false);
+    }
   };
 
   return (
@@ -126,10 +162,10 @@ const Login: React.FC<LoginProps> = ({ onLogin, data }) => {
         </form>
 
         <div className="pt-8 border-t border-amber-900/10 text-center">
-          <p className="text-[8px] text-amber-500/30 uppercase tracking-[0.3em] font-black flex items-center justify-center gap-2">
+          <div className="text-[8px] text-amber-500/30 uppercase tracking-[0.3em] font-black flex items-center justify-center gap-2">
             <div className="w-1.5 h-1.5 bg-amber-500 rounded-full animate-pulse"></div>
             Conexión Segura TLS 1.3 • Lovely's Studio
-          </p>
+          </div>
         </div>
       </div>
     </div>

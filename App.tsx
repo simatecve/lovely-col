@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import Sidebar from './components/Sidebar';
 import Dashboard from './components/Dashboard';
 import RoomView from './components/RoomView';
@@ -10,47 +10,127 @@ import Toast, { ToastMessage } from './components/Toast';
 import { AppData, ModelRoom, StudioRules as IRules, UserSession } from './types';
 import { INITIAL_DATA } from './constants';
 import { LogOut, X, AlertTriangle } from 'lucide-react';
-
-const STORAGE_KEY = 'webcam_studio_ai_data_v23';
-const SESSION_KEY = 'webcam_studio_user_session_v23';
+import { fetchAppState, upsertAppState } from './services/appStateService';
+import { supabase } from './services/supabaseClient';
 
 const App: React.FC = () => {
-  const [data, setData] = useState<AppData>(() => {
-    const saved = localStorage.getItem(STORAGE_KEY);
-    return saved ? JSON.parse(saved) : INITIAL_DATA;
-  });
-
-  const [currentUser, setCurrentUser] = useState<UserSession | null>(() => {
-    const savedSession = localStorage.getItem(SESSION_KEY);
-    return savedSession ? JSON.parse(savedSession) : null;
-  });
+  const [data, setData] = useState<AppData | null>(null);
+  const [currentUser, setCurrentUser] = useState<UserSession | null>(null);
+  const [isLoadingData, setIsLoadingData] = useState(true);
+  const [isLoadingSession, setIsLoadingSession] = useState(true);
+  const skipInitialSyncRef = useRef(true);
 
   const [currentView, setCurrentView] = useState<number | 'dashboard' | 'rules' | 'ai'>('dashboard');
   const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
 
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-  }, [data]);
-
-  useEffect(() => {
-    if (currentUser) {
-      const userExists = data.rules.accounts.some(acc => acc.id === currentUser.id);
-      if (!userExists) {
-        executeLogout();
+  const loadData = useCallback(async () => {
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      
+      // If not logged in, do not attempt to fetch remote state to avoid 401 error.
+      // We will rely on default data or wait until login.
+      if (!session) {
+        setData(INITIAL_DATA);
+        setIsLoadingData(false);
         return;
       }
-      localStorage.setItem(SESSION_KEY, JSON.stringify(currentUser));
-      
-      if (currentUser.role === 'model' && currentUser.roomId) {
-        const exists = data.rooms.some(r => r.id === currentUser.roomId);
-        if (exists) setCurrentView(currentUser.roomId);
-        else setCurrentView('dashboard');
+
+      const remoteData = await fetchAppState();
+      if (remoteData) {
+        setData(remoteData);
+      } else {
+        setData(INITIAL_DATA);
+        await upsertAppState(INITIAL_DATA);
       }
-    } else {
-      localStorage.removeItem(SESSION_KEY);
+    } catch {
+      setData(INITIAL_DATA);
+    } finally {
+      setIsLoadingData(false);
     }
-  }, [currentUser, data.rules.accounts, data.rooms]);
+  }, []);
+
+  useEffect(() => {
+    loadData();
+  }, [loadData]);
+
+  useEffect(() => {
+    // Only resolve user if we have data or if we are not blocked by missing data
+    // Actually, we want to resolve user regardless of data, 
+    // but the original logic depended on [data] for some reason.
+    // We'll keep it simple: resolve user independently.
+
+    const resolveUserFromSession = async (userId?: string | null) => {
+      if (!userId) {
+        setCurrentUser(null);
+        return;
+      }
+      const { data: profile, error } = await supabase
+        .from('profiles')
+        .select('username, full_name, role, room_id')
+        .eq('id', userId)
+        .maybeSingle();
+
+      if (error || !profile) {
+        setCurrentUser(null);
+        return;
+      }
+
+      const role = profile.role === 'admin' || profile.role === 'manager' || profile.role === 'model'
+        ? profile.role
+        : 'model';
+
+      setCurrentUser({
+        id: userId,
+        name: profile.full_name || profile.username,
+        role,
+        username: profile.username,
+        roomId: profile.room_id ?? undefined
+      });
+    };
+
+    const loadSession = async () => {
+      const { data: sessionData } = await supabase.auth.getSession();
+      await resolveUserFromSession(sessionData.session?.user?.id);
+      setIsLoadingSession(false);
+    };
+
+    loadSession();
+
+    const { data: authListener } = supabase.auth.onAuthStateChange((event, session) => {
+      resolveUserFromSession(session?.user?.id);
+      if (event === 'SIGNED_IN') {
+        loadData();
+      }
+    });
+
+    return () => {
+      authListener.subscription.unsubscribe();
+    };
+  }, [loadData]);
+
+  useEffect(() => {
+    if (!data || isLoadingData) return;
+    if (skipInitialSyncRef.current) {
+      skipInitialSyncRef.current = false;
+      return;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      upsertAppState(data);
+    }, 600);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [data, isLoadingData]);
+
+  useEffect(() => {
+    if (!data || !currentUser) return;
+    if (currentUser.role === 'model' && currentUser.roomId) {
+      const exists = data.rooms.some(r => r.id === currentUser.roomId);
+      if (exists) setCurrentView(currentUser.roomId);
+      else setCurrentView('dashboard');
+    }
+  }, [currentUser, data]);
 
   const addToast = useCallback((text: string, type: ToastMessage['type'] = 'success') => {
     const id = Math.random().toString(36).substring(2, 9);
@@ -62,30 +142,46 @@ const App: React.FC = () => {
   }, []);
 
   const updateRoom = (updatedRoom: ModelRoom) => {
-    setData(prev => ({
-      ...prev,
-      rooms: prev.rooms.map(r => r.id === updatedRoom.id ? { ...updatedRoom } : r)
-    }));
+    setData(prev => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        rooms: prev.rooms.map(r => r.id === updatedRoom.id ? { ...updatedRoom } : r)
+      };
+    });
   };
 
   const updateRooms = (updatedRooms: ModelRoom[]) => {
-    setData(prev => ({ ...prev, rooms: [...updatedRooms] }));
+    setData(prev => {
+      if (!prev) return prev;
+      return { ...prev, rooms: [...updatedRooms] };
+    });
   };
 
   const updateRules = (updatedRules: IRules) => {
-    setData(prev => ({ ...prev, rules: { ...updatedRules } }));
+    setData(prev => {
+      if (!prev) return prev;
+      return { ...prev, rules: { ...updatedRules } };
+    });
   };
 
-  const executeLogout = () => {
-    localStorage.removeItem(SESSION_KEY);
+  const executeLogout = async () => {
+    await supabase.auth.signOut();
     setCurrentUser(null);
     setCurrentView('dashboard');
     sessionStorage.clear();
-    window.location.replace(window.location.origin + window.location.pathname);
   };
 
+  if (isLoadingData || isLoadingSession || !data) {
+    return (
+      <div className="min-h-screen bg-black flex items-center justify-center">
+        <div className="text-amber-400 font-black uppercase text-xs tracking-[0.4em]">Conectando...</div>
+      </div>
+    );
+  }
+
   if (!currentUser) {
-    return <Login onLogin={setCurrentUser} data={data} />;
+    return <Login onLogin={setCurrentUser} />;
   }
 
   const renderContent = () => {
